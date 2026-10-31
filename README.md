@@ -19,7 +19,10 @@ A DLL injector for Windows executables running under Proton/Wine on Linux. Suppo
 - Steam runtime integration (reaper/launch wrapper) for Steam API authentication
 - umu-run support for non-Steam games
 - Zenity-based GUI for both Steam and non-Steam workflows
-- Detailed logging
+- No console window and no console output at all (GUI subsystem binary)
+- The target inherits the injector's working directory; paths can be relative
+- Unix paths are converted in-process (`wine_get_dos_file_name`), no `winepath` run
+- Optional log file (`--log-file`), nothing is logged otherwise
 
 ## Injection Methods
 
@@ -52,6 +55,12 @@ make
 ```
 
 Produces `bin/injector32.exe` and `bin/injector64.exe`. The correct binary is selected automatically by the helper scripts based on the target executable.
+
+Both binaries are linked as Windows GUI subsystem executables (`-Wl,--subsystem,windows`).
+A console subsystem binary makes Wine/Proton open a console window for it, which is
+exactly what you do not want next to a game. The injector therefore has no console at
+all: `--help` and argument errors open a message box, and everything else is written to
+the optional `--log-file`.
 
 ## Usage
 
@@ -133,28 +142,55 @@ PROTONPATH=/path/to/GE-Proton ./scripts/umu.sh \
 
 ### Direct Usage
 
+The injector is meant to be started from the directory the game lives in: the
+target process inherits the current directory of the injector, and all paths
+can be given relative to it.
+
+Unix paths are accepted as well (`/home/you/games/game.exe`). They are converted
+in-process with `kernel32!wine_get_dos_file_name` — the same call `winepath`
+uses — so no `winepath` / `getcompatpath` / extra Proton run is needed.
+
 ```bash
-# Inside a Proton/Wine environment
-injector64.exe "Z:\path\to\game.exe" "Z:\path\to\mod.dll" --method apc --log-file "Z:\path\to\injector.log"
+# From the game directory
+injector64.exe game.exe mod.dll --method apc --log-file injector.log
+
+# With absolute unix paths
+injector64.exe /games/foo/game.exe /games/foo/mod.dll --log-file /tmp/inject.log
 
 # With multiple DLLs (injected in order)
-injector64.exe "Z:\path\to\game.exe" "Z:\path\to\mod1.dll" "Z:\path\to\mod2.dll" --method apc
+injector64.exe game.exe mod1.dll mod2.dll --method apc
 
-# With target launch options
-injector64.exe "Z:\path\to\game.exe" "Z:\path\to\mod.dll" -- --your -target=options
+# With target launch options (everything after '--' goes to the target)
+injector64.exe game.exe mod.dll -- --your -target=options
+
+# Show the help (a message box, there is no console)
+injector64.exe --help
 ```
 
 Options:
 - `--method <type>` — Injection method: `standard`, `apc`, `nt`, `hook`, `manual_map` (default: `standard`)
-- `--log-file <path>` — Log file path (Windows-style `Z:` paths when under Proton)
+- `--log-file <path>` — Write a log file; relative paths are resolved against the
+  current directory. Without this option nothing is logged at all.
 - `--sleep <ms>` — Delay in milliseconds before injection (default: `0`)
 - `--follow-sleep <ms>` — Delay in milliseconds before injecting into the followed child process (default: `0`)
 - `--follow-process` — After the target exits with code `0`, inject into the best-matching child process
 - `--follow-process-name <name>` — Preferred child process executable name when using `--follow-process`
 - `--no-parent` — Skip injecting into the target; inject into its child process instead
+- `--help`, `-h` — Show the usage message
 - `--` — End of injector options; pass remaining args to the target executable
 
 Multiple DLLs can be specified by listing them consecutively: `injector64.exe game.exe dll1.dll dll2.dll dll3.dll`
+
+### No console output
+
+The injector is built as a Windows GUI subsystem executable and never writes to a
+console, so Wine/Proton does not open a console window for it and nothing can
+disturb the game's own output:
+
+- Progress and errors are only written to the file given with `--log-file`.
+- `--help` and argument errors (missing/unknown/invalid arguments) are shown in a
+  message box. Fatal startup errors (target or DLL missing, process creation
+  failed) are shown the same way.
 
 ## How It Works
 

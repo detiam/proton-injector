@@ -165,6 +165,10 @@ if [ "${FOLLOW_PROCESS:-false}" = "true" ]; then
     fi
 fi
 
+# The injector does not set a working directory: the target inherits the
+# injector's current directory, so start everything from the game directory.
+cd "$(dirname "$TARGET_EXE")" || exit 1
+
 umu-run \
     "$INJECTOR_EXE" \
     "$WIN_TARGET" \

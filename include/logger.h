@@ -11,6 +11,7 @@ typedef enum {
 
 BOOL logger_init(const wchar_t *log_path);
 void logger_cleanup(void);
+BOOL logger_is_active(void);
 void logger_log(LogLevel level, const wchar_t *format, ...);
 
 #define LOG_DEBUG(fmt, ...) logger_log(LOG_LEVEL_DEBUG, fmt, ##__VA_ARGS__)

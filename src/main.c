@@ -51,28 +51,174 @@ static void log_process_list(void) {
     CloseHandle(snapshot);
 }
 
-static void print_usage(const wchar_t *program_name) {
-    wprintf(L"Proton DLL Injector v%hs\n", VERSION);
-    wprintf(L"Usage: %ls <target.exe> <dll.dll> [dll2.dll ...] [options]\n\n", program_name);
-    wprintf(L"Arguments:\n");
-    wprintf(L"  target.exe              Path to the target executable\n");
-    wprintf(L"  dll.dll [dll2.dll ...]  Path(s) to DLL(s) to inject (in order)\n\n");
-    wprintf(L"Options:\n");
-    wprintf(L"  --method <type>         Injection method (standard, apc, nt, hook, manual_map) [default: standard]\n");
-    wprintf(L"  --log-file <path>       Log file path\n");
-    wprintf(L"  --sleep <ms>            Delay in milliseconds before injection [default: 0]\n");
-    wprintf(L"  --follow-sleep <ms>     Delay in milliseconds before injecting into followed child process [default: 0]\n");
-    wprintf(L"  --follow-process        Inject into best child process when parent exits with 0\n");
-    wprintf(L"  --follow-process-name   Preferred child process executable name\n");
-    wprintf(L"  --no-parent             Skip parent injection; inject into child process instead\n\n");
-    wprintf(L"  --                      End of injector options; pass remaining args to target\n\n");
-    wprintf(L"Example:\n");
-    wprintf(L"  %ls \"Z:\\path\\to\\game.exe\" \"Z:\\path\\to\\mod.dll\" --method apc -- --foo bar\n", program_name);
+/* ------------------------------------------------------------------------- *
+ * There is no console: --help and argument errors are reported through a
+ * message box, everything else is only ever written to the optional log file.
+ * ------------------------------------------------------------------------- */
+
+static const wchar_t *base_name(const wchar_t *path) {
+    const wchar_t *slash = wcsrchr(path, L'\\');
+    const wchar_t *fwd   = wcsrchr(path, L'/');
+    if (fwd && (!slash || fwd > slash))
+        slash = fwd;
+    return slash ? slash + 1 : path;
 }
 
-static int parse_arguments(int argc, wchar_t **argv, Arguments *args) {
-    if (argc < 3)
+/* wsprintfW is limited to 1024 bytes of output, so build text with this */
+static void str_printf(wchar_t *dst, size_t cap, const wchar_t *format, ...) {
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf(dst, cap, format, args);
+    va_end(args);
+    dst[cap - 1] = L'\0';
+}
+
+static void str_append(wchar_t *dst, size_t cap, const wchar_t *format, ...) {
+    size_t used = wcslen(dst);
+    if (used + 1 >= cap)
+        return;
+
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf(dst + used, cap - used, format, args);
+    va_end(args);
+    dst[cap - 1] = L'\0';
+}
+
+static void show_message(const wchar_t *text, UINT icon) {
+    wchar_t title[64];
+    str_printf(title, 64, L"Proton DLL Injector v%hs", VERSION);
+    MessageBoxW(NULL, text, title, MB_OK | icon | MB_SETFOREGROUND);
+}
+
+/* ------------------------------------------------------------------------- *
+ * Path handling
+ *
+ * Wine exports the very same conversion winepath uses, so unix paths (as they
+ * come from the shell scripts) can be resolved in-process instead of starting
+ * winepath - or even a second proton instance - just to convert a few paths.
+ * ------------------------------------------------------------------------- */
+
+typedef WCHAR *(__stdcall *wine_get_dos_file_name_fn)(const char *unix_name);
+
+static char *wide_to_utf8(const wchar_t *text) {
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0)
+        return NULL;
+
+    char *out = (char *)malloc((size_t)needed);
+    if (!out)
+        return NULL;
+
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out, needed, NULL, NULL);
+    return out;
+}
+
+/* A leading '/' means the caller passed a unix path: let Wine map it exactly
+ * like winepath would (that also covers paths inside the prefix, i.e. C:).
+ * Everything else is a Windows path and only needs to be made absolute. */
+static BOOL path_to_windows(const wchar_t *path, wchar_t *out, size_t out_cap) {
+    if (path[0] == L'/') {
+        wine_get_dos_file_name_fn convert = (wine_get_dos_file_name_fn)(void *)
+            GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "wine_get_dos_file_name");
+        if (convert) {
+            char *unix_path = wide_to_utf8(path);
+            if (unix_path) {
+                WCHAR *windows_path = convert(unix_path);
+                free(unix_path);
+                if (windows_path) {
+                    size_t len = wcslen(windows_path);
+                    BOOL fits = len + 1 <= out_cap;
+                    if (fits)
+                        memcpy(out, windows_path, (len + 1) * sizeof(wchar_t));
+                    /* wine allocates it on the process heap */
+                    HeapFree(GetProcessHeap(), 0, windows_path);
+                    if (fits)
+                        return TRUE;
+                }
+            }
+        }
+    }
+
+    return GetFullPathNameW(path, (DWORD)out_cap, out, NULL) != 0;
+}
+
+/* All paths in here are relative on purpose: the injector is normally started
+ * from the directory the game lives in, so relative paths are what the user
+ * actually types. */
+static void format_usage(wchar_t *buf, size_t cap, const wchar_t *program_name) {
+    buf[0] = L'\0';
+    str_append(buf, cap,
+        L"Usage: %ls <target.exe> <dll.dll> [dll2.dll ...] [options] [-- target args]\n\n",
+        base_name(program_name));
+    str_append(buf, cap,
+        L"Arguments:\n"
+        L"  target.exe              Target executable\n"
+        L"  dll.dll [dll2.dll ...]  DLL(s) to inject, in order\n\n"
+        L"Options:\n"
+        L"  --method <type>         standard, apc, nt, hook, manual_map [default: standard]\n"
+        L"  --log-file <path>       Write a log file (relative to the current directory).\n"
+        L"                          Without it nothing is logged.\n"
+        L"  --sleep <ms>            Delay before injection [default: 0]\n"
+        L"  --follow-sleep <ms>     Delay before injecting into followed child [default: 0]\n"
+        L"  --follow-process        Inject into best child process when parent exits with 0\n"
+        L"  --follow-process-name   Preferred child process executable name\n"
+        L"  --no-parent             Skip parent injection; inject into child process instead\n"
+        L"  --help, -h              Show this message\n"
+        L"  --                      End of injector options; pass remaining args to target\n\n"
+        L"The target process runs in the current directory of the injector.\n"
+        L"Unix paths (/home/...) are converted by Wine, no winepath needed.\n\n"
+        L"Example:\n"
+        L"  %ls game.exe mod.dll --method apc -- --foo bar\n",
+        base_name(program_name));
+}
+
+static int show_usage(const wchar_t *program_name, const wchar_t *detail, int exit_code) {
+    static wchar_t usage[4096];
+    format_usage(usage, 4096, program_name);
+
+    if (detail && *detail) {
+        static wchar_t text[4600];
+        str_printf(text, 4600, L"%ls\n\n%ls", detail, usage);
+        show_message(text, MB_ICONWARNING);
+    } else {
+        show_message(usage, MB_ICONINFORMATION);
+    }
+
+    return exit_code;
+}
+
+/* Errors before the target is started are visible to the user, otherwise a
+ * silent failure would look like the game simply refusing to launch. */
+static int fail_with_message(const wchar_t *format, ...) {
+    wchar_t text[1024];
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf(text, 1024, format, args);
+    va_end(args);
+    text[1023] = L'\0';
+
+    show_message(text, MB_ICONERROR);
+    return 1;
+}
+
+static BOOL wants_help(int argc, wchar_t **argv) {
+    for (int i = 1; i < argc; i++) {
+        if (wcscmp(argv[i], L"--") == 0)
+            return FALSE;
+        if (wcscmp(argv[i], L"--help") == 0 || wcscmp(argv[i], L"-h") == 0 ||
+            wcscmp(argv[i], L"-?") == 0 || wcscmp(argv[i], L"/?") == 0)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+static int parse_arguments(int argc, wchar_t **argv, Arguments *args,
+                           wchar_t *err, size_t err_cap) {
+    if (argc < 3) {
+        str_printf(err, err_cap, L"Not enough arguments.");
         return 0;
+    }
 
     args->target_exe          = argv[1];
     args->dll_paths           = NULL;
@@ -89,8 +235,10 @@ static int parse_arguments(int argc, wchar_t **argv, Arguments *args) {
 
     int dll_capacity = 8;
     args->dll_paths = (wchar_t **)malloc(dll_capacity * sizeof(wchar_t *));
-    if (!args->dll_paths)
+    if (!args->dll_paths) {
+        str_printf(err, err_cap, L"Out of memory.");
         return 0;
+    }
 
     int i = 2;
     for (; i < argc; i++) {
@@ -105,15 +253,19 @@ static int parse_arguments(int argc, wchar_t **argv, Arguments *args) {
         if (args->dll_count == dll_capacity) {
             dll_capacity *= 2;
             wchar_t **resized = (wchar_t **)realloc(args->dll_paths, dll_capacity * sizeof(wchar_t *));
-            if (!resized)
+            if (!resized) {
+                str_printf(err, err_cap, L"Out of memory.");
                 return 0;
+            }
             args->dll_paths = resized;
         }
         args->dll_paths[args->dll_count++] = argv[i];
     }
 
-    if (args->dll_count == 0)
+    if (args->dll_count == 0) {
+        str_printf(err, err_cap, L"No DLL given: at least one DLL is required.");
         return 0;
+    }
 
     for (; i < argc; i++) {
         if (wcscmp(argv[i], L"--") == 0) {
@@ -146,9 +298,21 @@ static int parse_arguments(int argc, wchar_t **argv, Arguments *args) {
             else if (wcscmp(method, L"manual_map") == 0)
                 args->method = INJECTION_MANUAL_MAP;
             else {
-                wprintf(L"Error: Invalid injection method '%ls'\n", method);
+                str_printf(err, err_cap,
+                           L"Invalid injection method: '%ls'\n"
+                           L"Valid values: standard, apc, nt, hook, manual_map.", method);
                 return 0;
             }
+        } else if (wcscmp(argv[i], L"--log-file") == 0 ||
+                   wcscmp(argv[i], L"--sleep") == 0 ||
+                   wcscmp(argv[i], L"--follow-sleep") == 0 ||
+                   wcscmp(argv[i], L"--follow-process-name") == 0 ||
+                   wcscmp(argv[i], L"--method") == 0) {
+            str_printf(err, err_cap, L"Option '%ls' requires a value.", argv[i]);
+            return 0;
+        } else {
+            str_printf(err, err_cap, L"Unknown option: '%ls'.", argv[i]);
+            return 0;
         }
     }
 
@@ -510,14 +674,26 @@ static void inject_into_followed_process(DWORD follow_pid, wchar_t **dll_paths, 
 int wmain(int argc, wchar_t **argv) {
     Arguments args;
 
-    if (!parse_arguments(argc, argv, &args)) {
-        print_usage(argv[0]);
-        return 1;
-    }
+    if (wants_help(argc, argv))
+        return show_usage(argv[0], NULL, 0);
 
-    if (args.log_file) {
-        if (!logger_init(args.log_file))
-            wprintf(L"Warning: Failed to initialize logger\n");
+    wchar_t err[512] = L"";
+    if (!parse_arguments(argc, argv, &args, err, 512))
+        return show_usage(argv[0], err, 1);
+
+    /* No --log-file means no log at all: there is no console to fall back to */
+    wchar_t log_path[MAX_PATH];
+    const wchar_t *log_file = args.log_file;
+
+    if (log_file) {
+        if (path_to_windows(log_file, log_path, MAX_PATH))
+            log_file = log_path;
+
+        if (!logger_init(log_file))
+            fail_with_message(L"Could not open the log file:\n%ls\n\nContinuing without a log.",
+                              args.log_file);
+        else
+            LOG_INFO(L"Log file: %ls", log_file);
     }
 
     LOG_INFO(L"Proton DLL Injector v%hs", VERSION);
@@ -527,14 +703,14 @@ int wmain(int argc, wchar_t **argv) {
 
     wchar_t target_exe_full[MAX_PATH];
 
-    if (!GetFullPathNameW(args.target_exe, MAX_PATH, target_exe_full, NULL)) {
+    if (!path_to_windows(args.target_exe, target_exe_full, MAX_PATH)) {
         LOG_ERROR(L"Invalid target executable path");
-        return 1;
+        return fail_with_message(L"Invalid target executable path:\n%ls", args.target_exe);
     }
 
     if (GetFileAttributesW(target_exe_full) == INVALID_FILE_ATTRIBUTES) {
         LOG_ERROR(L"Target executable not found: %ls", target_exe_full);
-        return 1;
+        return fail_with_message(L"Target executable not found:\n%ls", args.target_exe);
     }
 
     wchar_t **dll_paths_full = (wchar_t **)malloc(args.dll_count * sizeof(wchar_t *));
@@ -552,28 +728,26 @@ int wmain(int argc, wchar_t **argv) {
             return 1;
         }
 
-        if (!GetFullPathNameW(args.dll_paths[i], MAX_PATH, dll_paths_full[i], NULL)) {
+        if (!path_to_windows(args.dll_paths[i], dll_paths_full[i], MAX_PATH)) {
             LOG_ERROR(L"Invalid DLL path: %ls", args.dll_paths[i]);
             for (int j = 0; j <= i; j++) free(dll_paths_full[j]);
             free(dll_paths_full);
-            return 1;
+            return fail_with_message(L"Invalid DLL path:\n%ls", args.dll_paths[i]);
         }
 
         if (GetFileAttributesW(dll_paths_full[i]) == INVALID_FILE_ATTRIBUTES) {
             LOG_ERROR(L"DLL not found: %ls", dll_paths_full[i]);
             for (int j = 0; j <= i; j++) free(dll_paths_full[j]);
             free(dll_paths_full);
-            return 1;
+            return fail_with_message(L"DLL not found:\n%ls", args.dll_paths[i]);
         }
     }
 
-    wchar_t workdir[MAX_PATH];
-    wcscpy(workdir, target_exe_full);
-    wchar_t *last_slash = wcsrchr(workdir, L'\\');
-    if (last_slash)
-        *last_slash = L'\0';
-
-    LOG_INFO(L"Working directory: %ls", workdir);
+    /* No working directory is passed to CreateProcessW on purpose: the target
+     * inherits the current directory the injector was started from. */
+    wchar_t cwd[MAX_PATH] = L"";
+    if (GetCurrentDirectoryW(MAX_PATH, cwd))
+        LOG_INFO(L"Working directory: %ls", cwd);
     LOG_INFO(L"Starting target process...");
 
     STARTUPINFOW si = {0};
@@ -609,12 +783,14 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
-                        CREATE_SUSPENDED, NULL, workdir, &si, &pi)) {
-        LOG_ERROR(L"Failed to create process: error %lu", GetLastError());
+                        CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
+        DWORD create_error = GetLastError();
+        LOG_ERROR(L"Failed to create process: error %lu", create_error);
         free(cmdline);
         for (int i = 0; i < args.dll_count; i++) free(dll_paths_full[i]);
         free(dll_paths_full);
-        return 1;
+        return fail_with_message(L"Failed to start the target process:\n%ls\n\nWindows error %lu",
+                                 args.target_exe, create_error);
     }
 
     free(cmdline);
