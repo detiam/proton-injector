@@ -93,6 +93,67 @@ static void show_message(const wchar_t *text, UINT icon) {
     MessageBoxW(NULL, text, title, MB_OK | icon | MB_SETFOREGROUND);
 }
 
+/* ------------------------------------------------------------------------- *
+ * Path handling
+ *
+ * Wine exports the very same conversion winepath uses, so unix paths (as they
+ * come from the shell scripts) can be resolved in-process instead of starting
+ * winepath - or even a second proton instance - just to convert a few paths.
+ * ------------------------------------------------------------------------- */
+
+typedef WCHAR *(__stdcall *wine_get_dos_file_name_fn)(const char *unix_name);
+
+static wine_get_dos_file_name_fn wine_path_converter(void) {
+    static wine_get_dos_file_name_fn convert;
+
+    if (!convert)
+        convert = (wine_get_dos_file_name_fn)(void *)GetProcAddress(
+            GetModuleHandleW(L"kernel32.dll"), "wine_get_dos_file_name");
+
+    return convert;
+}
+
+static char *wide_to_utf8(const wchar_t *text) {
+    int needed = WideCharToMultiByte(CP_UTF8, 0, text, -1, NULL, 0, NULL, NULL);
+    if (needed <= 0)
+        return NULL;
+
+    char *out = (char *)malloc((size_t)needed);
+    if (!out)
+        return NULL;
+
+    WideCharToMultiByte(CP_UTF8, 0, text, -1, out, needed, NULL, NULL);
+    return out;
+}
+
+/* A leading '/' means the caller passed a unix path: let Wine map it exactly
+ * like winepath would (that also covers paths inside the prefix, i.e. C:).
+ * Everything else is a Windows path and only needs to be made absolute. */
+static BOOL path_to_windows(const wchar_t *path, wchar_t *out, size_t out_cap) {
+    if (path[0] == L'/') {
+        wine_get_dos_file_name_fn convert = wine_path_converter();
+        if (convert) {
+            char *unix_path = wide_to_utf8(path);
+            if (unix_path) {
+                WCHAR *windows_path = convert(unix_path);
+                free(unix_path);
+                if (windows_path) {
+                    size_t len = wcslen(windows_path);
+                    BOOL fits = len + 1 <= out_cap;
+                    if (fits)
+                        memcpy(out, windows_path, (len + 1) * sizeof(wchar_t));
+                    /* wine allocates it on the process heap */
+                    HeapFree(GetProcessHeap(), 0, windows_path);
+                    if (fits)
+                        return TRUE;
+                }
+            }
+        }
+    }
+
+    return GetFullPathNameW(path, (DWORD)out_cap, out, NULL) != 0;
+}
+
 /* All paths in here are relative on purpose: the injector is normally started
  * from the directory the game lives in, so relative paths are what the user
  * actually types. */
@@ -116,7 +177,8 @@ static void format_usage(wchar_t *buf, size_t cap, const wchar_t *program_name) 
         L"  --no-parent             Skip parent injection; inject into child process instead\n"
         L"  --help, -h              Show this message\n"
         L"  --                      End of injector options; pass remaining args to target\n\n"
-        L"The target process runs in the current directory of the injector.\n\n"
+        L"The target process runs in the current directory of the injector.\n"
+        L"Unix paths (/home/...) are converted by Wine, no winepath needed.\n\n"
         L"Example:\n"
         L"  %ls game.exe mod.dll --method apc -- --foo bar\n",
         base_name(program_name));
@@ -631,17 +693,23 @@ int wmain(int argc, wchar_t **argv) {
         return show_usage(argv[0], err, 1);
 
     /* No --log-file means no log at all: there is no console to fall back to */
-    if (args.log_file && !logger_init(args.log_file))
+    wchar_t log_path[MAX_PATH];
+    const wchar_t *log_file = args.log_file;
+
+    if (log_file && path_to_windows(log_file, log_path, MAX_PATH))
+        log_file = log_path;
+
+    if (log_file && !logger_init(log_file))
         fail_with_message(L"Could not open the log file:\n%ls\n\nContinuing without a log.",
                           args.log_file);
 
     LOG_INFO(L"Proton DLL Injector v%hs", VERSION);
-    if (args.log_file)
-        LOG_INFO(L"Log file: %ls", args.log_file);
+    if (log_file)
+        LOG_INFO(L"Log file: %ls", log_file);
 
     wchar_t target_exe_full[MAX_PATH];
 
-    if (!GetFullPathNameW(args.target_exe, MAX_PATH, target_exe_full, NULL)) {
+    if (!path_to_windows(args.target_exe, target_exe_full, MAX_PATH)) {
         LOG_ERROR(L"Invalid target executable path");
         return fail_with_message(L"Invalid target executable path:\n%ls", args.target_exe);
     }
@@ -668,7 +736,7 @@ int wmain(int argc, wchar_t **argv) {
             return 1;
         }
 
-        if (!GetFullPathNameW(args.dll_paths[i], MAX_PATH, dll_paths_full[i], NULL)) {
+        if (!path_to_windows(args.dll_paths[i], dll_paths_full[i], MAX_PATH)) {
             LOG_ERROR(L"Invalid DLL path: %ls", args.dll_paths[i]);
             for (int j = 0; j <= i; j++) free(dll_paths_full[j]);
             free(dll_paths_full);
