@@ -142,17 +142,13 @@ done
 
 PROTON="${PROTON_PATH:-proton-ge}"
 
-to_windows_path() {
-    echo "Z:$(realpath "$1" | sed 's/\//\\/g')"
-}
-
-WIN_INJECTOR=$(to_windows_path "$INJECTOR_EXE")
-WIN_TARGET=$(to_windows_path "$TARGET_EXE")
-WIN_DLLS=()
-for dll in "${DLL_PATHS[@]}"; do
-    WIN_DLLS+=("$(to_windows_path "$dll")")
+# The injector converts unix paths itself (Wine does the mapping), so nothing has
+# to be translated here. Paths are only made absolute, because the script cd's
+# into the game directory before launching.
+TARGET_EXE=$(realpath -m "$TARGET_EXE")
+for i in "${!DLL_PATHS[@]}"; do
+    DLL_PATHS[$i]=$(realpath -m "${DLL_PATHS[$i]}")
 done
-WIN_LOG=$(to_windows_path "$LOG_FILE")
 
 echo "╔═══════════════════════════════════════════════════════════════════════════╗"
 echo "║                          Proton DLL Injector                              ║"
@@ -206,7 +202,7 @@ fi
 # injector's current directory, so start everything from the game directory.
 cd "$(dirname "$TARGET_EXE")" || exit 1
 
-PROTON_CMD=("$PROTON" waitforexitandrun "$WIN_INJECTOR" "$WIN_TARGET" "${WIN_DLLS[@]}" --log-file "$WIN_LOG" "${SLEEP_ARGS[@]}" "${FOLLOW_SLEEP_ARGS[@]}" "${NO_PARENT_ARGS[@]}" "${FOLLOW_ARGS[@]}" "${INJECTOR_ARGS[@]}")
+PROTON_CMD=("$PROTON" waitforexitandrun "$INJECTOR_EXE" "$TARGET_EXE" "${DLL_PATHS[@]}" --log-file "$LOG_FILE" "${SLEEP_ARGS[@]}" "${FOLLOW_SLEEP_ARGS[@]}" "${NO_PARENT_ARGS[@]}" "${FOLLOW_ARGS[@]}" "${INJECTOR_ARGS[@]}")
 
 if [ "${APPID}" != "0" ] && [ -n "${APPID}" ] && [ -x "$STEAM_LAUNCHER" ] && [ -x "$STEAM_REAPER" ]; then
     "$STEAM_LAUNCHER" -- "$STEAM_REAPER" SteamLaunch AppId="$APPID" -- "${PROTON_CMD[@]}"

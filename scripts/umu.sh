@@ -106,16 +106,13 @@ export PROTONPATH
 export WINEPREFIX="${WINEPREFIX:-$HOME/.proton-injector/pfx}"
 export GAMEID="${GAMEID:-0}"
 
-to_windows_path() {
-    echo "Z:$(realpath "$1" | sed 's/\//\\/g')"
-}
-
-WIN_TARGET=$(to_windows_path "$TARGET_EXE")
-WIN_DLLS=()
-for dll in "${DLL_PATHS[@]}"; do
-    WIN_DLLS+=("$(to_windows_path "$dll")")
+# The injector converts unix paths itself (Wine does the mapping), so nothing has
+# to be translated here. Paths are only made absolute, because the script cd's
+# into the game directory before launching.
+TARGET_EXE=$(realpath -m "$TARGET_EXE")
+for i in "${!DLL_PATHS[@]}"; do
+    DLL_PATHS[$i]=$(realpath -m "${DLL_PATHS[$i]}")
 done
-WIN_LOG=$(to_windows_path "$LOG_FILE")
 
 echo "╔═══════════════════════════════════════════════════════════════════════════╗"
 echo "║                      Proton DLL Injector (umu-run)                        ║"
@@ -171,9 +168,9 @@ cd "$(dirname "$TARGET_EXE")" || exit 1
 
 umu-run \
     "$INJECTOR_EXE" \
-    "$WIN_TARGET" \
-    "${WIN_DLLS[@]}" \
-    --log-file "$WIN_LOG" \
+    "$TARGET_EXE" \
+    "${DLL_PATHS[@]}" \
+    --log-file "$LOG_FILE" \
     "${SLEEP_ARGS[@]}" \
     "${FOLLOW_SLEEP_ARGS[@]}" \
     "${NO_PARENT_ARGS[@]}" \
