@@ -1,7 +1,10 @@
 CC32 = i686-w64-mingw32-gcc
 CC64 = x86_64-w64-mingw32-gcc
 CFLAGS = -Wall -O2 -Iinclude -municode -fno-stack-protector
-LDFLAGS = -municode -lkernel32 -luser32
+# GUI subsystem on purpose: a console subsystem binary makes Wine/Proton create
+# a console window for it. The injector never writes to a console anyway - help
+# and argument errors go to a message box, progress to the optional log file.
+LDFLAGS = -municode -Wl,--subsystem,windows -lkernel32 -luser32
 
 SRC_DIR = src
 BUILD_DIR = build
