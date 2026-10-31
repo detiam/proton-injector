@@ -685,13 +685,11 @@ int wmain(int argc, wchar_t **argv) {
         LOG_INFO(L"DLL %d/%d: %ls", i + 1, args.dll_count, dll_paths_full[i]);
     }
 
-    wchar_t workdir[MAX_PATH];
-    wcscpy(workdir, target_exe_full);
-    wchar_t *last_slash = wcsrchr(workdir, L'\\');
-    if (last_slash)
-        *last_slash = L'\0';
-
-    LOG_INFO(L"Working directory: %ls", workdir);
+    /* No working directory is passed to CreateProcessW on purpose: the target
+     * inherits the current directory the injector was started from. */
+    wchar_t cwd[MAX_PATH] = L"";
+    if (GetCurrentDirectoryW(MAX_PATH, cwd))
+        LOG_INFO(L"Working directory: %ls", cwd);
     LOG_INFO(L"Starting target process...");
 
     STARTUPINFOW si = {0};
@@ -727,7 +725,7 @@ int wmain(int argc, wchar_t **argv) {
     }
 
     if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
-                        CREATE_SUSPENDED, NULL, workdir, &si, &pi)) {
+                        CREATE_SUSPENDED, NULL, NULL, &si, &pi)) {
         DWORD create_error = GetLastError();
         LOG_ERROR(L"Failed to create process: error %lu", create_error);
         free(cmdline);

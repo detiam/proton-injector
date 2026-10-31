@@ -202,6 +202,10 @@ if [ "${FOLLOW_PROCESS:-false}" = "true" ]; then
     fi
 fi
 
+# The injector does not set a working directory: the target inherits the
+# injector's current directory, so start everything from the game directory.
+cd "$(dirname "$TARGET_EXE")" || exit 1
+
 PROTON_CMD=("$PROTON" waitforexitandrun "$WIN_INJECTOR" "$WIN_TARGET" "${WIN_DLLS[@]}" --log-file "$WIN_LOG" "${SLEEP_ARGS[@]}" "${FOLLOW_SLEEP_ARGS[@]}" "${NO_PARENT_ARGS[@]}" "${FOLLOW_ARGS[@]}" "${INJECTOR_ARGS[@]}")
 
 if [ "${APPID}" != "0" ] && [ -n "${APPID}" ] && [ -x "$STEAM_LAUNCHER" ] && [ -x "$STEAM_REAPER" ]; then
