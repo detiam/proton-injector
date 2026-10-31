@@ -1,8 +1,12 @@
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <stdarg.h>
-#include <time.h>
 #include "logger.h"
+
+/* The binaries are GUI subsystem executables: there is no console, and every
+ * LOG_* call can only ever reach the log file (which exists only when
+ * --log-file was given). Nothing here writes to stdout/stderr any more. */
 
 static FILE *log_file = NULL;
 static CRITICAL_SECTION log_lock;
@@ -15,7 +19,9 @@ BOOL logger_init(const wchar_t *log_path) {
 
     InitializeCriticalSection(&log_lock);
 
-    log_file = _wfopen(log_path, L"w");
+    /* binary mode on purpose: lines are written as explicit UTF-8 bytes below,
+     * so non-ASCII paths never depend on the CRT locale or a console code page */
+    log_file = _wfopen(log_path, L"wb");
     if (!log_file) {
         DeleteCriticalSection(&log_lock);
         return FALSE;
@@ -31,7 +37,7 @@ void logger_cleanup(void) {
     }
 
     EnterCriticalSection(&log_lock);
-    
+
     if (log_file) {
         fclose(log_file);
         log_file = NULL;
@@ -39,11 +45,15 @@ void logger_cleanup(void) {
 
     LeaveCriticalSection(&log_lock);
     DeleteCriticalSection(&log_lock);
-    
+
     logger_initialized = FALSE;
 }
 
 void logger_log(LogLevel level, const wchar_t *format, ...) {
+    if (!logger_initialized || !log_file) {
+        return;
+    }
+
     const wchar_t *level_str;
     switch (level) {
         case LOG_LEVEL_DEBUG: level_str = L"DEBUG"; break;
@@ -57,25 +67,38 @@ void logger_log(LogLevel level, const wchar_t *format, ...) {
     GetLocalTime(&st);
 
     wchar_t timestamp[32];
-    wsprintfW(timestamp, L"%04d-%02d-%02d %02d:%02d:%02d",
-              st.wYear, st.wMonth, st.wDay,
-              st.wHour, st.wMinute, st.wSecond);
+    swprintf(timestamp, 32, L"%04d-%02d-%02d %02d:%02d:%02d",
+             st.wYear, st.wMonth, st.wDay,
+             st.wHour, st.wMinute, st.wSecond);
 
     wchar_t message[2048];
     va_list args;
     va_start(args, format);
-    vswprintf(message, 2048, format, args);
+    _vsnwprintf(message, 2048, format, args);
+    message[2047] = L'\0';
     va_end(args);
 
     wchar_t log_line[2560];
-    wsprintfW(log_line, L"[%ls] [%ls] %ls\n", timestamp, level_str, message);
+    _snwprintf(log_line, 2560, L"[%ls] [%ls] %ls\n", timestamp, level_str, message);
+    log_line[2559] = L'\0';
 
-    wprintf(L"%ls", log_line);
-
-    if (logger_initialized && log_file) {
-        EnterCriticalSection(&log_lock);
-        fwprintf(log_file, L"%ls", log_line);
-        fflush(log_file);
-        LeaveCriticalSection(&log_lock);
+    int needed = WideCharToMultiByte(CP_UTF8, 0, log_line, -1, NULL, 0, NULL, NULL);
+    if (needed <= 1) {
+        return;
     }
+
+    char *utf8 = (char *)malloc((size_t)needed);
+    if (!utf8) {
+        return;
+    }
+    WideCharToMultiByte(CP_UTF8, 0, log_line, -1, utf8, needed, NULL, NULL);
+
+    EnterCriticalSection(&log_lock);
+    if (log_file) {
+        fwrite(utf8, 1, (size_t)needed - 1, log_file);
+        fflush(log_file);
+    }
+    LeaveCriticalSection(&log_lock);
+
+    free(utf8);
 }
